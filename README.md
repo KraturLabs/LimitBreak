@@ -35,7 +35,15 @@ LimitBreak must be loaded as a **POL plugin** during startup. It cannot be enabl
 
 With FFXI closed, copy `limitbreak.dll` into Ashita's `polplugins` folder.
 
-Then add these entries to the Ashita boot profile you use to launch FFXI:
+Open the Ashita boot profile you use to launch FFXI. Boot profiles are `.ini` files inside:
+
+```text
+<Ashita>\config\boot\
+```
+
+If you launch Ashita from a shortcut, the boot profile filename is usually shown at the end of the shortcut's **Target**.
+
+Find the existing `[ashita.polplugins]` and `[ashita.polplugins.args]` sections and add the LimitBreak lines below. If either section does not already exist, add it.
 
 ```ini
 [ashita.polplugins]
