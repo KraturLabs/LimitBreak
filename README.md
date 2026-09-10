@@ -131,4 +131,4 @@ For implementation and testing details, see:
 - [Runtime discovery](docs/NATIVE_DISCOVERY.md)
 - [Discovery tools](docs/DISCOVERY.md)
 
-LimitBreak is released under the [GNU General Public License v3](LICENSE), matching SpectralFix's licensing approach. Third-party dependencies retain their own licenses.
+LimitBreak is released under the [GNU General Public License v3](LICENSE). Third-party dependencies retain their own licenses.
