@@ -90,7 +90,7 @@ Fallback and structural failures also produce an Ashita chat warning.
 
 LimitBreak checks a number of things before it changes anything. Among other checks, it makes sure:
 
-- it found one unambiguous FFXI memory layout that it understands
+- it found exactly one compatible memory layout inside the current FFXI process
 - the resource pools have not already been created
 - the values it plans to change are still the expected stock values
 - the discovered code has not changed between inspection and patching
