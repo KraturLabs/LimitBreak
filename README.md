@@ -51,8 +51,6 @@ To disable LimitBreak, completely exit FFXI, remove or disable its POL plugin en
 
 ## Compatibility
 
-LimitBreak does not use one fixed memory address or require a different DLL for every private server.
-
 When FFXI starts, LimitBreak looks for the part of the game responsible for creating this resource memory system. It then checks the surrounding code and memory relationships to make sure they match a layout LimitBreak understands.
 
 If exactly one compatible layout is found, LimitBreak applies the change.
