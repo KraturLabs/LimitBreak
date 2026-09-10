@@ -140,9 +140,9 @@ public:
         dryRun(args && strcmp(args, "discover") == 0) {}
     const char* GetName() const override { return "LimitBreak"; }
     const char* GetAuthor() const override { return "KraturLabs"; }
-    const char* GetDescription() const override { return "Experimental startup-only 320 MiB FFXI pool patch"; }
+    const char* GetDescription() const override { return "Startup-only 320 MiB FFXI resource-pool expansion"; }
     const char* GetLink() const override { return ""; }
-    double GetVersion() const override { return 0.1; }
+    double GetVersion() const override { return 1.0; }
     uint32_t GetFlags() const override {
         return static_cast<uint32_t>(Ashita::PluginFlags::UseDirect3D)
             | static_cast<uint32_t>(Ashita::PluginFlags::UseCommands);
@@ -162,7 +162,7 @@ public:
             logFile = CreateFileW((directory / name).c_str(), GENERIC_WRITE, FILE_SHARE_READ,
                 nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (logFile == INVALID_HANDLE_VALUE) return false;
-            Log("START", "LimitBreak 0.1 Ashita 4.30 x86; startup experiment; no on-disk game patch");
+            Log("START", "LimitBreak 1.0 Ashita 4.30 x86; startup-only resource-pool expansion; no on-disk game patch");
             if (!explicitTarget && !dryRun) { Refuse("requires explicit POL argument 320 or discover"); return false; }
             if (dryRun) Log(patchRequested ? "DISCOVERY_START" : "DRYRUN_START", "read-only native discovery; kernel32 memory-query interception only; no FFXiMain writes or hash/RVA compatibility gate");
             patchRequested = explicitTarget;

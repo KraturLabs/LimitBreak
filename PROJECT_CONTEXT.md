@@ -39,6 +39,8 @@ Supported instruction families are bounded, not universal client compatibility.
 Finite pools can exhaust/fragment; added backing consumes x86 address space.
 Automated coverage is not long-term, GPU or all-subsystem safety acceptance.
 The release tree is the maintained product baseline, distributed under GPLv3
-with the full license in LICENSE. Versioned GitHub releases provide limitbreak.dll.
-Next: ordinary product use;
+with the full license in LICENSE. Plugin metadata reports version 1.0.
+The v1.0.0 draft package contains limitbreak.dll, README.md and LICENSE, with
+separate SHA256SUMS.txt covering the ZIP and DLL. Publication awaits approval.
+Next: review the draft release;
 changes require a separately scoped task. No additional live testing is queued.
