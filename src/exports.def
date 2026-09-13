@@ -1,0 +1,5 @@
+LIBRARY limitbreak
+EXPORTS
+    expCreatePolPlugin=_expCreatePolPlugin@4
+    expDestroyPlugin=_expDestroyPlugin@4
+    expGetInterfaceVersion=_expGetInterfaceVersion@0
