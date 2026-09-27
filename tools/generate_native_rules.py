@@ -1,4 +1,4 @@
-"""Generate C++ rule strings from the same source used by Python discovery."""
+"""Generate native C++ rule strings from discovery_rules.py."""
 import argparse
 from pathlib import Path
 import discovery_rules

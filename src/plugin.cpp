@@ -15,14 +15,16 @@ Query originalQuery = nullptr;
 HANDLE logFile = INVALID_HANDLE_VALUE;
 SRWLOCK logLock = SRWLOCK_INIT;
 SRWLOCK patchLock = SRWLOCK_INIT;
-std::atomic<int> state{0}; // 0 inert, 1 armed, 2 patched, 3 verified, -1 refused/failure, 4 released, 5 allocation fallback
+enum class StartupState {
+    Inert, Armed, Patched, Verified, Refused, Released, Fallback,
+    DiscoveryArmed, Discovering, DiscoveryValidated
+};
+std::atomic<StartupState> state{StartupState::Inert};
 uintptr_t gameBase = 0;
 std::array<uint32_t, 5> poolGlobals{};
 bool patchRequested = false;
 unsigned logBytes = 0;
 ULONGLONG armedAt = 0;
-bool missedReported = false;
-constexpr int DryArmed = 10, DryRunning = 11, DryValidated = 12;
 
 void Log(const char* event, const char* details) {
     AcquireSRWLockExclusive(&logLock);
@@ -40,7 +42,38 @@ void Log(const char* event, const char* details) {
     }
     ReleaseSRWLockExclusive(&logLock);
 }
-void Refuse(const char* reason) { state.store(-1); Log("REFUSED", reason); }
+void Refuse(const char* reason) { state.store(StartupState::Refused); Log("REFUSED", reason); }
+
+// Release prepared hook storage and the log if startup fails before callbacks run.
+struct StartupResources {
+    bool minHookInitialized = false;
+    bool hookEnabled = false;
+    ~StartupResources() {
+        if (hookEnabled) return;
+        if (minHookInitialized) MH_Uninitialize(); // Prepared hooks have never run.
+        originalQuery = nullptr;
+        AcquireSRWLockExclusive(&logLock);
+        if (logFile != INVALID_HANDLE_VALUE) CloseHandle(logFile);
+        logFile = INVALID_HANDLE_VALUE;
+        ReleaseSRWLockExclusive(&logLock);
+    }
+};
+
+const char* Status(StartupState current) {
+    switch (current) {
+    case StartupState::Inert: return "Inactive.";
+    case StartupState::Armed: return "Waiting for startup pool initialization.";
+    case StartupState::Discovering: return "Validating the startup memory layout.";
+    case StartupState::Patched: return "PATCHED: 320 MiB requested; capacity not yet verified.";
+    case StartupState::Verified: return "CAPACITY_VERIFIED: 320 MiB resource pool.";
+    case StartupState::Fallback: return "CAPACITY_FALLBACK: 64 MiB resource pool, below stock 192 MiB.";
+    case StartupState::Refused: return "Refused or layout verification failed; see logs/limitbreak for the reason.";
+    case StartupState::Released: return "Released; restart without LimitBreak to restore stock capacity.";
+    case StartupState::DiscoveryArmed: return "Discovery mode: waiting for startup; no expansion requested.";
+    case StartupState::DiscoveryValidated: return "Discovery validated; no expansion requested.";
+    }
+    return "Unknown startup state.";
+}
 
 void DiscoverStartup(uintptr_t caller, HMODULE module, LPMEMORYSTATUS memory) {
     // The cheap return-site prefilter selects the same known initializer shape
@@ -52,11 +85,11 @@ void DiscoverStartup(uintptr_t caller, HMODULE module, LPMEMORYSTATUS memory) {
             reinterpret_cast<LPCWSTR>(caller), &owner) || owner != module
         || !Read(reinterpret_cast<void*>(caller), actual, sizeof(actual))
         || memcmp(actual, prefix, sizeof(prefix)) != 0) return;
-    int expected = patchRequested ? 1 : DryArmed;
-    if (!state.compare_exchange_strong(expected, DryRunning)) return;
+    auto expected = patchRequested ? StartupState::Armed : StartupState::DiscoveryArmed;
+    if (!state.compare_exchange_strong(expected, StartupState::Discovering)) return;
     AcquireSRWLockExclusive(&patchLock);
     struct Unlock { ~Unlock() { ReleaseSRWLockExclusive(&patchLock); } } unlock;
-    if (state.load() != DryRunning) return;
+    if (state.load() != StartupState::Discovering) return;
     try {
         const auto base = reinterpret_cast<uintptr_t>(module);
         const auto result = discovery::Discover(static_cast<uint32_t>(base),
@@ -84,19 +117,16 @@ void DiscoverStartup(uintptr_t caller, HMODULE module, LPMEMORYSTATUS memory) {
         _snprintf_s(text, sizeof(text), _TRUNCATE, "caller_matches=%u pools_uninitialized=%u armed_to_query_ms=%llu",
             callerMatches ? 1u : 0u, result.match.uninitialized ? 1u : 0u, GetTickCount64() - armedAt);
         Log(patchRequested ? "DISCOVERY_TIMING" : "DRYRUN_TIMING", text);
-        if (!callerMatches || !result.match.uninitialized) {
-            Refuse("startup structures valid but startup timing not established"); return;
-        }
         if (patchRequested) {
-            if (!memory || memory->dwLength != sizeof(MEMORYSTATUS)
-                || memory->dwTotalPhys / 1048576u < NewCap || result.match.cap != OriginalCap) {
-                Refuse("insufficient physical memory or cap is not stock"); return;
+            if (!memory || memory->dwLength != sizeof(MEMORYSTATUS)) {
+                Refuse("invalid memory-query result"); return;
             }
+            // PatchDiscovered owns the caller/timing, stock-cap and RAM gates.
             const auto patched = PatchDiscovered(base, caller, memory->dwTotalPhys / 1048576u, result);
             if (patched == PatchResult::Applied) {
                 gameBase = base;
                 poolGlobals = result.match.globals;
-                state.store(2);
+                state.store(StartupState::Patched);
                 Log("PATCHED", "discovered physical-memory cap 256->384 MiB; target pool 320 MiB; capacity not yet verified");
             } else {
                 Refuse(Name(patched));
@@ -107,8 +137,11 @@ void DiscoverStartup(uintptr_t caller, HMODULE module, LPMEMORYSTATUS memory) {
             }
             return;
         }
-        state.store(DryValidated);
-        Log(patchRequested ? "DISCOVERY_VALIDATED" : "DRYRUN_VALIDATED", "unique discovery at initializer query return before pool construction; FFXiMain and memory-query result unchanged; no patch");
+        if (!callerMatches || !result.match.uninitialized) {
+            Refuse("startup structures valid but startup timing not established"); return;
+        }
+        state.store(StartupState::DiscoveryValidated);
+        Log("DRYRUN_VALIDATED", "unique discovery at initializer query return before pool construction; FFXiMain and memory-query result unchanged; no patch");
     } catch (...) { Refuse("startup discovery exception"); }
 }
 
@@ -116,7 +149,8 @@ void WINAPI MemoryQuery(LPMEMORYSTATUS memory) {
     const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
     originalQuery(memory);
     const DWORD savedError = GetLastError();
-    if (state.load() == DryArmed || state.load() == 1) {
+    const auto current = state.load();
+    if (current == StartupState::DiscoveryArmed || current == StartupState::Armed) {
         const auto module = GetModuleHandleW(L"FFXiMain.dll");
         if (module) DiscoverStartup(caller, module, memory);
     }
@@ -141,13 +175,14 @@ public:
     const char* GetAuthor() const override { return "KraturLabs"; }
     const char* GetDescription() const override { return "Startup-only 320 MiB FFXI resource-pool expansion"; }
     const char* GetLink() const override { return ""; }
-    double GetVersion() const override { return 1.0; }
+    double GetVersion() const override { return 1.01; } // Ashita's numeric version for release 1.0.1.
     uint32_t GetFlags() const override {
         return static_cast<uint32_t>(Ashita::PluginFlags::UseDirect3D)
             | static_cast<uint32_t>(Ashita::PluginFlags::UseCommands);
     }
     bool Initialize(IAshitaCore* core, ILogManager*, uint32_t) override {
-        if (!core || state.load() != 0) return false;
+        if (!core || state.load() != StartupState::Inert) return false;
+        StartupResources resources;
         chat = core->GetChatManager();
         try {
             const char* install = core->GetInstallPath();
@@ -161,24 +196,27 @@ public:
             logFile = CreateFileW((directory / name).c_str(), GENERIC_WRITE, FILE_SHARE_READ,
                 nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (logFile == INVALID_HANDLE_VALUE) return false;
-            Log("START", "LimitBreak 1.0 Ashita 4.30 x86; startup-only resource-pool expansion; no on-disk game patch");
+            Log("START", "LimitBreak 1.0.1 Ashita 4.30 x86; startup-only resource-pool expansion; no on-disk game patch");
             if (!explicitTarget && !dryRun) { Refuse("requires explicit POL argument 320 or discover"); return false; }
-            if (dryRun) Log(patchRequested ? "DISCOVERY_START" : "DRYRUN_START", "read-only native discovery; kernel32 memory-query interception only; no FFXiMain writes or hash/RVA compatibility gate");
+            if (dryRun) Log("DRYRUN_START", "read-only native discovery; kernel32 memory-query interception only; no FFXiMain writes or hash/RVA compatibility gate");
             patchRequested = explicitTarget;
+            const auto initialized = MH_Initialize();
+            if (initialized != MH_OK) { Refuse("MinHook initialization failed"); return false; }
+            resources.minHookInitialized = true;
+            const auto target = reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GlobalMemoryStatus"));
+            if (!target || MH_CreateHook(target, &MemoryQuery, reinterpret_cast<void**>(&originalQuery)) != MH_OK) {
+                Refuse("could not prepare GlobalMemoryStatus hook"); return false;
+            }
+            // Pin only after preparation succeeds, before any callback can run.
             HMODULE pinned = nullptr;
             if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
                 reinterpret_cast<LPCWSTR>(&MemoryQuery), &pinned)) {
                 Refuse("could not pin callback module"); return false;
             }
-            const auto initialized = MH_Initialize();
-            if (initialized != MH_OK) { Refuse("MinHook initialization failed"); return false; }
-            const auto target = reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GlobalMemoryStatus"));
-            if (!target || MH_CreateHook(target, &MemoryQuery, reinterpret_cast<void**>(&originalQuery)) != MH_OK) {
-                Refuse("could not prepare GlobalMemoryStatus hook"); return false;
-            }
             armedAt = GetTickCount64();
-            state.store(dryRun ? DryArmed : 1);
+            state.store(dryRun ? StartupState::DiscoveryArmed : StartupState::Armed);
             if (MH_EnableHook(target) != MH_OK) { Refuse("could not enable GlobalMemoryStatus hook"); return false; }
+            resources.hookEnabled = true;
             Log("ARMED", dryRun ? "waiting for structurally recognized initializer query; one discovery pass; no patch"
                 : "waiting for uniquely validated pool-initializer call; other memory queries pass through unchanged");
             return true;
@@ -186,22 +224,21 @@ public:
     }
     void Direct3DPresent(const RECT*, const RECT*, HWND, const RGNDATA*) override {
         if (dryRun) {
-            if (state.load() == DryArmed) Refuse("dry-run missed initializer query before first render; startup timing unverified");
+            if (state.load() == StartupState::DiscoveryArmed) Refuse("dry-run missed initializer query before first render; startup timing unverified");
             return;
         }
-        if (state.load() == 1 && !missedReported && GetTickCount64() - armedAt > 30000) {
-            missedReported = true;
+        if (state.load() == StartupState::Armed && GetTickCount64() - armedAt > 30000) {
             Refuse("startup query not intercepted before rendering; pool not enlarged");
         }
-        if (state.load() != 2) return;
+        if (state.load() != StartupState::Patched) return;
         // One snapshot at the first post-patch present, after startup pool creation.
-        // Every outcome leaves state 2; this is not ongoing integrity monitoring.
+        // Every outcome leaves Patched; this is not ongoing integrity monitoring.
         PoolLayout pools{};
         bool readable = true;
         for (size_t i = 0; i < pools.size(); ++i)
             readable = Read(reinterpret_cast<void*>(gameBase + poolGlobals[i]), &pools[i], sizeof(pools[i])) && readable;
         if (!readable) {
-            state.store(-1);
+            state.store(StartupState::Refused);
             Log("CAPACITY_STRUCTURAL_FAILURE", "five-pool startup bounds unreadable; layout could not be verified");
             WarnCapacity(true);
             return;
@@ -213,26 +250,26 @@ public:
             pools[0].head, pools[0].end, pools[1].head, pools[1].end,
             pools[2].head, pools[2].end, pools[3].head, pools[3].end, pools[4].head, pools[4].end);
         if (result == LayoutResult::Expanded) {
-            state.store(3); Log("CAPACITY_VERIFIED", message);
+            state.store(StartupState::Verified); Log("CAPACITY_VERIFIED", message);
         } else if (result == LayoutResult::AllocationFallback) {
-            state.store(5); Log("CAPACITY_FALLBACK", message);
+            state.store(StartupState::Fallback); Log("CAPACITY_FALLBACK", message);
             WarnCapacity(false);
         } else {
-            state.store(-1); Log("CAPACITY_STRUCTURAL_FAILURE", message);
+            state.store(StartupState::Refused); Log("CAPACITY_STRUCTURAL_FAILURE", message);
             WarnCapacity(true);
         }
     }
     bool HandleCommand(int32_t, const char* command, bool) override {
         if (!command || _stricmp(command, "/limitbreak status") != 0) return false;
         char message[160];
-        if (dryRun) _snprintf_s(message, sizeof(message), _TRUNCATE, "state=%d (10 discovery armed,11 running,12 dry-run validated,-1 refused); no patch; see logs/limitbreak", state.load());
-        else _snprintf_s(message, sizeof(message), _TRUNCATE, "state=%d (1 armed,2 patched,3 verified,5 allocation 64 MiB fallback,-1 refused/structural failure); see logs/limitbreak", state.load());
+        _snprintf_s(message, sizeof(message), _TRUNCATE, "[LimitBreak] %s", Status(state.load()));
         Log("STATUS", message);
+        if (chat) chat->Write(207, false, message);
         return true;
     }
     void Release() override {
         AcquireSRWLockExclusive(&patchLock);
-        state.store(4);
+        state.store(StartupState::Released);
         chat = nullptr;
         ReleaseSRWLockExclusive(&patchLock);
         Log("RELEASE", dryRun ? "dry-run released; memory-query hook remains passthrough; no FFXiMain changes"

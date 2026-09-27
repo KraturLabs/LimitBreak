@@ -1,5 +1,7 @@
 # LimitBreak
 
+Current release: **1.0.1**. See the [changelog](CHANGELOG.md).
+
 LimitBreak is an **Ashita 4.30** plugin for Final Fantasy XI that gives the game more room for loaded resources, especially when using high-resolution texture packs.
 
 FFXI normally has about **192 MB** available in its main resource memory pool. LimitBreak increases that pool to **320 MB**.
@@ -80,14 +82,15 @@ After FFXI creates the pools, LimitBreak checks the resulting layout once to con
 
 ## Startup status
 
-`/limitbreak status` writes the current status to Ashita's `logs/limitbreak` folder.
+`/limitbreak status` shows the current status in chat and writes it to Ashita's
+`logs/limitbreak` folder.
 
 You may see these results:
 
 | Result | Meaning |
 | --- | --- |
 | `CAPACITY_VERIFIED` | The expected 320 MB resource pool was created successfully. |
-| `CAPACITY_FALLBACK` | FFXI could not create the larger allocation and used its built-in smaller fallback instead. |
+| `CAPACITY_FALLBACK` | FFXI could not create the larger allocation and used its built-in **64 MB** fallback, smaller than the stock **192 MB** pool. |
 | `CAPACITY_STRUCTURAL_FAILURE` | The resulting memory layout was not what LimitBreak expected. Restart without LimitBreak. |
 
 Fallback and structural failures also produce an Ashita chat warning.

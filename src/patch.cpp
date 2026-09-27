@@ -1,9 +1,7 @@
 #include "patch.h"
 #include "discovery.h"
-#include <bcrypt.h>
 #include <cstring>
 #include <vector>
-#include <limits>
 
 namespace limitbreak {
 LayoutResult VerifyLayout(const PoolLayout& pools) {
@@ -34,46 +32,6 @@ bool Read(const void* address, void* output, size_t size) {
     SIZE_T done = 0;
     return ReadProcessMemory(GetCurrentProcess(), address, output, size, &done) && done == size;
 }
-bool Hash(const void* data, size_t size, Digest& result) {
-    if (size > std::numeric_limits<ULONG>::max()) return false;
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0) return false;
-    const auto status = BCryptHash(alg, nullptr, 0,
-        reinterpret_cast<PUCHAR>(const_cast<void*>(data)), static_cast<ULONG>(size),
-        result.data(), static_cast<ULONG>(result.size()));
-    BCryptCloseAlgorithmProvider(alg, 0);
-    return status >= 0;
-}
-bool HashFile(const wchar_t* path, Digest& result) {
-    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return false;
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    DWORD objectSize = 0, returned = 0;
-    bool ok = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0;
-    if (ok) ok = BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH,
-        reinterpret_cast<PUCHAR>(&objectSize), sizeof(objectSize), &returned, 0) >= 0;
-    std::vector<unsigned char> object(objectSize);
-    if (ok) ok = BCryptCreateHash(alg, &hash, object.data(), objectSize, nullptr, 0, 0) >= 0;
-    unsigned char buffer[65536];
-    while (ok) {
-        DWORD count = 0;
-        if (!ReadFile(file, buffer, sizeof(buffer), &count, nullptr)) { ok = false; break; }
-        if (count == 0) break;
-        ok = BCryptHashData(hash, buffer, count, 0) >= 0;
-    }
-    if (ok) ok = BCryptFinishHash(hash, result.data(), static_cast<ULONG>(result.size()), 0) >= 0;
-    if (hash) BCryptDestroyHash(hash);
-    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
-    CloseHandle(file);
-    return ok;
-}
-std::string Hex(const Digest& value) {
-    const char* digits = "0123456789abcdef";
-    std::string text;
-    for (auto byte : value) { text += digits[byte >> 4]; text += digits[byte & 15]; }
-    return text;
-}
 PatchResult Patch(void* code, const std::vector<unsigned char>& expected,
     const std::array<size_t, 2>& operands) {
     const size_t size = expected.size();
@@ -90,46 +48,45 @@ PatchResult Patch(void* code, const std::vector<unsigned char>& expected,
     changed = original;
     memcpy(changed.data() + operands[0], &NewCap, sizeof(NewCap));
     memcpy(changed.data() + operands[1], &NewCap, sizeof(NewCap));
-    // Preserve each original protection when the discovered span crosses a page boundary.
-    struct Region { void* address; size_t size; DWORD protection; };
-    std::vector<Region> regions;
-    const auto start = reinterpret_cast<uintptr_t>(code);
-    const uint64_t end = uint64_t(start) + size;
-    if (end > 0x100000000ull) return PatchResult::Mismatch;
-    for (uint64_t at = start; at < end;) {
-        MEMORY_BASIC_INFORMATION info{};
-        if (!VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(at)), &info, sizeof(info)))
-            return PatchResult::ProtectionFailed;
-        const auto next = (std::min)(end, uint64_t(reinterpret_cast<uintptr_t>(info.BaseAddress)) + info.RegionSize);
-        if (next <= at || info.State != MEM_COMMIT) return PatchResult::ProtectionFailed;
-        regions.push_back({reinterpret_cast<void*>(static_cast<uintptr_t>(at)), static_cast<size_t>(next - at), info.Protect});
-        at = next;
-    }
-    const auto restore = [&regions](size_t count) {
+    // On x86, only the low byte differs between the two supported imm32 values.
+    static_assert((OriginalCap ^ NewCap) == 0x80);
+    if (uint64_t(reinterpret_cast<uintptr_t>(code)) + size > 0x100000000ull)
+        return PatchResult::Mismatch;
+    auto* bytes = static_cast<unsigned char*>(code);
+    std::array<DWORD, 2> protections{};
+    const auto restore = [&](size_t count) {
         bool ok = true; DWORD unused = 0;
-        for (size_t i = 0; i < count; ++i)
-            ok = (VirtualProtect(regions[i].address, regions[i].size, regions[i].protection, &unused) != FALSE) && ok;
+        // Reverse order also restores correctly when both operands share a page.
+        while (count > 0) {
+            --count;
+            ok = (VirtualProtect(bytes + operands[count], 1, protections[count], &unused) != FALSE) && ok;
+        }
         return ok;
     };
-    for (size_t i = 0; i < regions.size(); ++i) {
-        DWORD old = 0;
-        if (!VirtualProtect(regions[i].address, regions[i].size, PAGE_EXECUTE_READWRITE, &old))
+    for (size_t i = 0; i < operands.size(); ++i) {
+        if (!VirtualProtect(bytes + operands[i], 1, PAGE_EXECUTE_READWRITE, &protections[i]))
             return restore(i) ? PatchResult::ProtectionFailed : PatchResult::RollbackFailed;
     }
-    SIZE_T written = 0;
-    bool ok = WriteProcessMemory(GetCurrentProcess(), code, changed.data(), changed.size(), &written)
-        && written == changed.size();
+    const auto writeOperands = [&](const std::vector<unsigned char>& values) {
+        bool ok = true;
+        for (const auto offset : operands) {
+            SIZE_T written = 0;
+            ok = (WriteProcessMemory(GetCurrentProcess(), bytes + offset, values.data() + offset, 1, &written)
+                && written == 1) && ok;
+        }
+        return ok;
+    };
+    bool ok = writeOperands(changed);
     ok = ok && Read(code, check.data(), check.size()) && check == changed;
     ok = ok && FlushInstructionCache(GetCurrentProcess(), code, size);
-    if (ok && restore(regions.size())) return PatchResult::Applied;
+    if (ok && restore(operands.size())) return PatchResult::Applied;
     DWORD unused = 0;
-    for (const auto& region : regions)
-        VirtualProtect(region.address, region.size, PAGE_EXECUTE_READWRITE, &unused);
-    // The caller has not returned to this code yet. Restore the entire checked span on any error.
-    const bool restored = WriteProcessMemory(GetCurrentProcess(), code, original.data(), original.size(), &written)
-        && written == original.size() && Read(code, check.data(), check.size()) && check == original;
+    for (const auto offset : operands)
+        VirtualProtect(bytes + offset, 1, PAGE_EXECUTE_READWRITE, &unused);
+    // Restore only our two bytes, then verify the entire checked span.
+    const bool restored = writeOperands(original) && Read(code, check.data(), check.size()) && check == original;
     const bool flushed = FlushInstructionCache(GetCurrentProcess(), code, size) != FALSE;
-    const bool protectedAgain = restore(regions.size());
+    const bool protectedAgain = restore(operands.size());
     return restored && flushed && protectedAgain ? PatchResult::WriteFailed : PatchResult::RollbackFailed;
 }
 PatchResult PatchDiscovered(uintptr_t base, uintptr_t caller, uint32_t physicalMiB,
